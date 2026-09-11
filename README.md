@@ -9,7 +9,7 @@ Deployment artifacts for [frillz.lk](https://www.frillz.lk) (frontend) and [api.
 
 ## Deployment
 
-Pushing to `main` triggers `.github/workflows/deploy.yml`, which FTP-syncs `backend/` and `frontend/` to the server and restarts the Node.js app via the cPanel API.
+Pushing to `main` triggers `.github/workflows/deploy.yml`, which FTP-syncs `backend/` and `frontend/` to the server. The backend deploy also touches `backend/tmp/restart.txt` with a fresh timestamp on every run, which tells Passenger (used internally by cPanel's Node.js App) to restart the app on its next request — no cPanel API access needed.
 
 Environment-specific files are **not** managed by CI and must be configured directly on the server:
 
@@ -24,6 +24,3 @@ Environment-specific files are **not** managed by CI and must be configured dire
 | `FTP_SERVER` | FTP host |
 | `FTP_USERNAME` | FTP account username |
 | `FTP_PASSWORD` | FTP account password |
-| `CPANEL_HOST` | cPanel hostname (e.g. `node238.r-usdatacenter.register.lk:2083`) |
-| `CPANEL_USER` | cPanel username |
-| `CPANEL_API_TOKEN` | cPanel API token (Security > Manage API Tokens) |
