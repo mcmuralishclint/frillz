@@ -10,7 +10,7 @@ import express from "express";
 // _source_archive/server/storage.ts
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
-import { eq, asc, like, and, ne } from "drizzle-orm";
+import { eq, asc, desc, like, and, ne, sql } from "drizzle-orm";
 
 // backend-build/node_modules/zod/v4/classic/external.js
 var external_exports = {};
@@ -14145,6 +14145,7 @@ var orders = sqliteTable("orders", {
   // 'card', 'bank', 'cod'
   status: text("status").notNull().default("Processing"),
   // 'Processing', 'Packing', 'Shipped', 'Delivered'
+  trackingNumber: text("tracking_number"),
   // Dates
   createdAt: integer2("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => /* @__PURE__ */ new Date()),
   estimatedDelivery: integer2("estimated_delivery", { mode: "timestamp" })
@@ -14187,6 +14188,27 @@ var orderItems = sqliteTable("order_items", {
 var insertOrderItemSchema = createInsertSchema(orderItems).omit({
   id: true
 });
+var reviews = sqliteTable("reviews", {
+  id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+  productId: text("product_id").notNull(),
+  customerName: text("customer_name").notNull(),
+  email: text("email"),
+  rating: integer2("rating").notNull(),
+  comment: text("comment"),
+  isApproved: integer2("is_approved", { mode: "boolean" }).default(true),
+  createdAt: integer2("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => /* @__PURE__ */ new Date())
+});
+var insertReviewSchema = createInsertSchema(reviews).omit({
+  id: true,
+  isApproved: true,
+  createdAt: true
+});
+var wishlistItems = sqliteTable("wishlist_items", {
+  id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+  customerId: text("customer_id").notNull(),
+  productId: text("product_id").notNull(),
+  createdAt: integer2("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => /* @__PURE__ */ new Date())
+});
 
 // _source_archive/server/storage.ts
 import path from "path";
@@ -14196,6 +14218,30 @@ var __dirname = path.dirname(__filename);
 var dbPath = process.env.DATABASE_URL || path.resolve(process.cwd(), "sqlite.db");
 var client = new Database(dbPath);
 var db = drizzle(client);
+try {
+  client.exec("ALTER TABLE orders ADD COLUMN tracking_number TEXT");
+  console.log("✅ Migration: added orders.tracking_number column");
+} catch (migrationError) {
+  if (!String(migrationError.message).includes("duplicate column")) {
+    console.error("⚠️ Migration warning (orders.tracking_number):", migrationError.message);
+  }
+}
+client.exec(`CREATE TABLE IF NOT EXISTS reviews (
+  id TEXT PRIMARY KEY,
+  product_id TEXT NOT NULL,
+  customer_name TEXT NOT NULL,
+  email TEXT,
+  rating INTEGER NOT NULL,
+  comment TEXT,
+  is_approved INTEGER DEFAULT 1,
+  created_at INTEGER NOT NULL
+)`);
+client.exec(`CREATE TABLE IF NOT EXISTS wishlist_items (
+  id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL,
+  product_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+)`);
 var DatabaseStorage = class {
   // User operations
   async getUser(id) {
@@ -14345,14 +14391,28 @@ var DatabaseStorage = class {
   }
   // Order operations
   async createOrder(order, items) {
-    const orderResult = await db.insert(orders).values(order).returning();
-    const newOrder = orderResult[0];
-    const itemsWithOrderId = items.map((item) => ({
-      ...item,
-      orderId: newOrder.id
-    }));
-    await db.insert(orderItems).values(itemsWithOrderId);
-    return newOrder;
+    const runInTransaction = client.transaction(() => {
+      for (const item of items) {
+        if (!item.productId) continue;
+        const result = client.prepare(
+          `UPDATE products SET stock = stock - ? WHERE id = ? AND stock >= ?`
+        ).run(item.quantity, item.productId, item.quantity);
+        if (result.changes === 0) {
+          const err = new Error(`Insufficient stock for "${item.productName || item.productId}"`);
+          err.code = "INSUFFICIENT_STOCK";
+          throw err;
+        }
+      }
+      const orderResult = db.insert(orders).values(order).returning().all();
+      const newOrder = orderResult[0];
+      const itemsWithOrderId = items.map((item) => ({
+        ...item,
+        orderId: newOrder.id
+      }));
+      db.insert(orderItems).values(itemsWithOrderId).run();
+      return newOrder;
+    });
+    return runInTransaction();
   }
   async getOrder(id) {
     const result = await db.select().from(orders).where(eq(orders.id, id));
@@ -14364,13 +14424,42 @@ var DatabaseStorage = class {
   async getOrders() {
     return await db.select().from(orders);
   }
-  async updateOrderStatus(id, status, estimatedDelivery) {
+  async updateOrderStatus(id, status, estimatedDelivery, trackingNumber) {
     const updates = { status };
     if (estimatedDelivery) {
       updates.estimatedDelivery = estimatedDelivery;
     }
+    if (trackingNumber !== void 0) {
+      updates.trackingNumber = trackingNumber;
+    }
     const result = await db.update(orders).set(updates).where(eq(orders.id, id)).returning();
     return result[0];
+  }
+  // Review operations
+  async getReviewsByProduct(productId) {
+    return await db.select().from(reviews).where(and(eq(reviews.productId, productId), eq(reviews.isApproved, true))).orderBy(desc(reviews.createdAt));
+  }
+  async createReview(review) {
+    const result = await db.insert(reviews).values(review).returning();
+    return result[0];
+  }
+  // Wishlist operations
+  async getWishlist(customerId) {
+    return await db.select().from(wishlistItems).where(eq(wishlistItems.customerId, customerId));
+  }
+  async getWishlistItem(customerId, productId) {
+    const result = await db.select().from(wishlistItems).where(and(eq(wishlistItems.customerId, customerId), eq(wishlistItems.productId, productId)));
+    return result[0];
+  }
+  async addWishlistItem(item) {
+    const existing = await this.getWishlistItem(item.customerId, item.productId);
+    if (existing) return existing;
+    const result = await db.insert(wishlistItems).values(item).returning();
+    return result[0];
+  }
+  async removeWishlistItem(customerId, productId) {
+    const result = await db.delete(wishlistItems).where(and(eq(wishlistItems.customerId, customerId), eq(wishlistItems.productId, productId))).returning();
+    return result.length > 0;
   }
   // Promo code operations
   async getAllPromoCodes() {
@@ -14418,7 +14507,36 @@ async function registerRoutes(httpServer2, app2) {
   console.log("\u{1F680} Server starting - performing initialization...");
   app2.get("/api/products", async (req, res) => {
     try {
-      const products2 = await storage.getAllProducts();
+      let products2 = await storage.getAllProducts();
+      const { category, minPrice, maxPrice, size, sort, isNew, isBestSeller } = req.query;
+      if (category) {
+        const cats = String(category).split(",").map((c) => c.trim().toLowerCase()).filter(Boolean);
+        if (cats.length > 0) {
+          products2 = products2.filter((p) => {
+            const pCats = (Array.isArray(p.category) ? p.category : [p.category]).map((c) => String(c).toLowerCase());
+            return cats.some((c) => pCats.includes(c));
+          });
+        }
+      }
+      if (minPrice !== void 0) {
+        const min = Number(minPrice);
+        if (!isNaN(min)) products2 = products2.filter((p) => p.price >= min);
+      }
+      if (maxPrice !== void 0) {
+        const max = Number(maxPrice);
+        if (!isNaN(max)) products2 = products2.filter((p) => p.price <= max);
+      }
+      if (size) {
+        const sizes = String(size).split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
+        if (sizes.length > 0) {
+          products2 = products2.filter((p) => Array.isArray(p.sizes) && p.sizes.some((s) => sizes.includes(String(s).toUpperCase())));
+        }
+      }
+      if (isNew === "true") products2 = products2.filter((p) => p.isNew);
+      if (isBestSeller === "true") products2 = products2.filter((p) => p.isBestSeller);
+      if (sort === "price_asc") products2 = [...products2].sort((a, b) => a.price - b.price);
+      else if (sort === "price_desc") products2 = [...products2].sort((a, b) => b.price - a.price);
+      else if (sort === "name_asc") products2 = [...products2].sort((a, b) => a.name.localeCompare(b.name));
       res.json(products2);
     } catch (error48) {
       console.error("Error fetching products:", error48);
@@ -14457,6 +14575,75 @@ async function registerRoutes(httpServer2, app2) {
     } catch (error48) {
       console.error("Error fetching products by category:", error48);
       res.status(500).json({ error: "Failed to fetch products" });
+    }
+  });
+  app2.get("/api/products/:id/reviews", async (req, res) => {
+    try {
+      const productReviews = await storage.getReviewsByProduct(req.params.id);
+      const count = productReviews.length;
+      const average = count > 0 ? productReviews.reduce((sum, r) => sum + r.rating, 0) / count : 0;
+      res.json({ reviews: productReviews, count, average: Math.round(average * 10) / 10 });
+    } catch (error48) {
+      console.error("Error fetching reviews:", error48);
+      res.status(500).json({ error: "Failed to fetch reviews" });
+    }
+  });
+  app2.post("/api/products/:id/reviews", async (req, res) => {
+    try {
+      const product = await storage.getProduct(req.params.id);
+      if (!product) {
+        return res.status(404).json({ error: "Product not found" });
+      }
+      const validatedData = insertReviewSchema.parse({ ...req.body, productId: req.params.id });
+      if (validatedData.rating < 1 || validatedData.rating > 5) {
+        return res.status(400).json({ error: "Rating must be between 1 and 5" });
+      }
+      const review = await storage.createReview(validatedData);
+      res.status(201).json(review);
+    } catch (error48) {
+      console.error("Error creating review:", error48);
+      res.status(400).json({ error: "Invalid review data", details: error48 instanceof Error ? error48.message : String(error48) });
+    }
+  });
+  app2.get("/api/wishlist/:customerId", async (req, res) => {
+    try {
+      const items = await storage.getWishlist(req.params.customerId);
+      const allProducts = await storage.getAllProducts();
+      const productsById = new Map(allProducts.map((p) => [p.id, p]));
+      const wishlistProducts = items.map((item) => productsById.get(item.productId)).filter(Boolean);
+      res.json(wishlistProducts);
+    } catch (error48) {
+      console.error("Error fetching wishlist:", error48);
+      res.status(500).json({ error: "Failed to fetch wishlist" });
+    }
+  });
+  app2.post("/api/wishlist", async (req, res) => {
+    try {
+      const { customerId, productId } = req.body;
+      if (!customerId || !productId) {
+        return res.status(400).json({ error: "customerId and productId are required" });
+      }
+      const product = await storage.getProduct(productId);
+      if (!product) {
+        return res.status(404).json({ error: "Product not found" });
+      }
+      const item = await storage.addWishlistItem({ customerId, productId });
+      res.status(201).json(item);
+    } catch (error48) {
+      console.error("Error adding to wishlist:", error48);
+      res.status(400).json({ error: "Failed to add to wishlist" });
+    }
+  });
+  app2.delete("/api/wishlist/:customerId/:productId", async (req, res) => {
+    try {
+      const removed = await storage.removeWishlistItem(req.params.customerId, req.params.productId);
+      if (!removed) {
+        return res.status(404).json({ error: "Wishlist item not found" });
+      }
+      res.json({ success: true });
+    } catch (error48) {
+      console.error("Error removing from wishlist:", error48);
+      res.status(500).json({ error: "Failed to remove from wishlist" });
     }
   });
   app2.post("/api/products", requireAdmin, async (req, res) => {
@@ -15080,6 +15267,9 @@ async function registerRoutes(httpServer2, app2) {
         console.error("Error message:", error48.message);
         console.error("Error stack:", error48.stack);
       }
+      if (error48 instanceof Error && error48.code === "INSUFFICIENT_STOCK") {
+        return res.status(409).json({ error: error48.message });
+      }
       res.status(400).json({ error: "Invalid order data", details: error48 instanceof Error ? error48.message : String(error48) });
     }
   });
@@ -15115,12 +15305,12 @@ async function registerRoutes(httpServer2, app2) {
       if (isNaN(id)) {
         return res.status(400).json({ error: "Invalid order ID" });
       }
-      const { status, estimatedDelivery } = req.body;
+      const { status, estimatedDelivery, trackingNumber } = req.body;
       if (!status) {
         return res.status(400).json({ error: "Status is required" });
       }
       const deliveryDate = estimatedDelivery ? new Date(estimatedDelivery) : void 0;
-      const updatedOrder = await storage.updateOrderStatus(id, status, deliveryDate);
+      const updatedOrder = await storage.updateOrderStatus(id, status, deliveryDate, trackingNumber);
       if (!updatedOrder) {
         return res.status(404).json({ error: "Order not found" });
       }
