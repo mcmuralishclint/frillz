@@ -14443,6 +14443,13 @@ var DatabaseStorage = class {
     const result = await db.insert(reviews).values(review).returning();
     return result[0];
   }
+  async getAllReviews() {
+    return await db.select().from(reviews).orderBy(desc(reviews.createdAt));
+  }
+  async deleteReview(id) {
+    const result = await db.delete(reviews).where(eq(reviews.id, id)).returning();
+    return result.length > 0;
+  }
   // Wishlist operations
   async getWishlist(customerId) {
     return await db.select().from(wishlistItems).where(eq(wishlistItems.customerId, customerId));
@@ -14603,6 +14610,27 @@ async function registerRoutes(httpServer2, app2) {
     } catch (error48) {
       console.error("Error creating review:", error48);
       res.status(400).json({ error: "Invalid review data", details: error48 instanceof Error ? error48.message : String(error48) });
+    }
+  });
+  app2.get("/api/admin/reviews", requireAdmin, async (req, res) => {
+    try {
+      const allReviews = await storage.getAllReviews();
+      res.json(allReviews);
+    } catch (error48) {
+      console.error("Error fetching reviews:", error48);
+      res.status(500).json({ error: "Failed to fetch reviews" });
+    }
+  });
+  app2.delete("/api/admin/reviews/:id", requireAdmin, async (req, res) => {
+    try {
+      const deleted = await storage.deleteReview(req.params.id);
+      if (!deleted) {
+        return res.status(404).json({ error: "Review not found" });
+      }
+      res.json({ success: true });
+    } catch (error48) {
+      console.error("Error deleting review:", error48);
+      res.status(500).json({ error: "Failed to delete review" });
     }
   });
   app2.get("/api/wishlist/:customerId", async (req, res) => {
